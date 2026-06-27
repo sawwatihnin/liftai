@@ -71,10 +71,6 @@ export type CoachDiagnostics = {
   webcamActive: boolean;
 };
 
-export type PoseSnapshot = {
-  joints: PoseJoints;
-  angles: PoseAngles;
-  feedback: FormFeedback;
-  squat: SquatMetrics;
-  timestamp: number;
-};
+// PoseSnapshot has been replaced by ExerciseSnapshot in src/exercises/types.ts.
+// The squat-specific types above are retained as internal implementation details
+// used by src/analysis/* and src/exercises/backSquat.ts.

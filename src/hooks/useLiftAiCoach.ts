@@ -1,18 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { NormalizedLandmark, PoseLandmarkerResult } from '@mediapipe/tasks-vision';
 import { AudioFeedbackManager } from '../analysis/audioFeedback';
-import { analyzeForm } from '../analysis/formAnalysis';
-import { SquatStateMachine } from '../analysis/squatStateMachine';
-import { getCoachingCue } from '../analysis/voiceCoaching';
+import type { ExerciseAnalyzer, ExerciseDefinition, ExerciseSnapshot } from '../exercises/types';
 import {
   getPoseAssetConfig,
   getPoseLandmarker,
   createDrawingUtils,
-  extractTrackedJoints,
 } from '../pose/poseLandmarker';
-import type { CoachDiagnostics, PoseSnapshot } from '../pose/types';
+import type { CoachDiagnostics } from '../pose/types';
 import { drawPoseSkeleton } from '../pose/drawPose';
-import { calculatePoseAngles } from '../utils/angles';
+import { computeAngles } from '../utils/angles';
 import { normalizeError } from '../utils/errors';
 
 type CoachState = {
@@ -21,7 +18,7 @@ type CoachState = {
   isRunning: boolean;
   isLoading: boolean;
   audioEnabled: boolean;
-  snapshot: PoseSnapshot | null;
+  snapshot: ExerciseSnapshot | null;
   error: string | null;
   sessionStartedAt: number | null;
 };
@@ -32,22 +29,18 @@ const PARTIAL_POSE_VISIBLE_JOINTS = 4;
 const UI_UPDATE_INTERVAL_MS = 120;
 const DIAGNOSTIC_LOG_INTERVAL = 15;
 
-export function useLiftAiCoach() {
+// Accepts an ExerciseDefinition which provides angle computation, rep detection,
+// coaching, and dashboard config. Pass null when no exercise is selected yet.
+export function useLiftAiCoach(exerciseDefinition: ExerciseDefinition | null) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const animationFrameRef = useRef<number | null>(null);
-  const machineRef = useRef(new SquatStateMachine());
+  const analyzerRef = useRef<ExerciseAnalyzer | null>(null);
   const audioRef = useRef(new AudioFeedbackManager());
-  const lastRepRef = useRef(0);
   const poseVisibleRef = useRef(false);
   const frameCountRef = useRef(0);
   const lastUiUpdateRef = useRef(0);
-  const coachingStateRef = useRef({
-    previousCorrection: null as 'Go deeper.' | 'Keep your chest up.' | 'Knees out.' | null,
-    previousPhase: null as PoseSnapshot['squat']['phase'] | null,
-    previousRepCount: 0,
-  });
 
   const [state, setState] = useState<CoachState>({
     diagnostics: {
@@ -84,6 +77,12 @@ export function useLiftAiCoach() {
   });
   const [clockTick, setClockTick] = useState(0);
 
+  // Recreate the analyzer whenever the exercise changes so session state resets cleanly.
+  useEffect(() => {
+    analyzerRef.current?.reset();
+    analyzerRef.current = exerciseDefinition?.createAnalyzer() ?? null;
+  }, [exerciseDefinition]);
+
   function logStartupEvent(event: string) {
     console.info(`[LiftAI] ${event}`);
     setState((current) => ({
@@ -109,11 +108,7 @@ export function useLiftAiCoach() {
     void navigator.permissions
       .query({ name: 'camera' as PermissionName })
       .then((result) => {
-        if (cancelled) {
-          return;
-        }
-
-        console.info('[LiftAI] Camera permission status detected.', result.state);
+        if (cancelled) return;
         setState((current) => ({
           ...current,
           diagnostics: {
@@ -122,9 +117,7 @@ export function useLiftAiCoach() {
           },
         }));
       })
-      .catch((error) => {
-        console.warn('[LiftAI] Camera permission query failed.', error);
-      });
+      .catch(() => {});
 
     return () => {
       cancelled = true;
@@ -138,42 +131,29 @@ export function useLiftAiCoach() {
   }, []);
 
   useEffect(() => {
-    if (!state.isRunning) {
-      return;
-    }
-
+    if (!state.isRunning) return;
     const intervalId = window.setInterval(() => {
       setClockTick((tick) => tick + 1);
     }, 1000);
-
     return () => window.clearInterval(intervalId);
   }, [state.isRunning]);
 
   const sessionDurationMs = useMemo(() => {
-    if (!state.sessionStartedAt) {
-      return 0;
-    }
-
+    if (!state.sessionStartedAt) return 0;
     return Date.now() - state.sessionStartedAt;
   }, [clockTick, state.sessionStartedAt, state.snapshot?.timestamp]);
 
   async function start() {
-    if (state.isRunning || state.isLoading) {
-      return;
-    }
+    if (state.isRunning || state.isLoading) return;
+    if (!exerciseDefinition) return;
 
     logStartupEvent('START_CAMERA_CLICKED');
-    console.info('[LiftAI] Webcam startup requested.');
+
     if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
       const message = 'Camera APIs are unavailable in this browser.';
-      console.error('[LiftAI] Webcam startup blocked.', message);
       setState((current) => ({
         ...current,
-        diagnostics: {
-          ...current.diagnostics,
-          cameraAvailable: false,
-          startupStage: 'failed',
-        },
+        diagnostics: { ...current.diagnostics, cameraAvailable: false, startupStage: 'failed' },
         errors: appendError(current.errors, message),
         error: message,
       }));
@@ -185,10 +165,7 @@ export function useLiftAiCoach() {
       logStartupEvent('VIDEO_REF_MISSING');
       setState((current) => ({
         ...current,
-        diagnostics: {
-          ...current.diagnostics,
-          startupStage: 'failed',
-        },
+        diagnostics: { ...current.diagnostics, startupStage: 'failed' },
         errors: appendError(current.errors, message),
         error: message,
       }));
@@ -200,10 +177,7 @@ export function useLiftAiCoach() {
       logStartupEvent('CANVAS_REF_MISSING');
       setState((current) => ({
         ...current,
-        diagnostics: {
-          ...current.diagnostics,
-          startupStage: 'failed',
-        },
+        diagnostics: { ...current.diagnostics, startupStage: 'failed' },
         errors: appendError(current.errors, message),
         error: message,
       }));
@@ -214,23 +188,18 @@ export function useLiftAiCoach() {
       ...current,
       isLoading: true,
       error: null,
-      diagnostics: {
-        ...current.diagnostics,
-        startupStage: 'camera_starting',
-      },
+      diagnostics: { ...current.diagnostics, startupStage: 'camera_starting' },
     }));
 
     try {
-      machineRef.current.reset();
-      lastRepRef.current = 0;
+      // Reset per-session state.
+      if (!analyzerRef.current) {
+        analyzerRef.current = exerciseDefinition.createAnalyzer();
+      }
+      analyzerRef.current.reset();
       poseVisibleRef.current = false;
       frameCountRef.current = 0;
       lastUiUpdateRef.current = 0;
-      coachingStateRef.current = {
-        previousCorrection: null,
-        previousPhase: null,
-        previousRepCount: 0,
-      };
       audioRef.current.reset();
 
       logStartupEvent('GET_USER_MEDIA_START');
@@ -244,18 +213,14 @@ export function useLiftAiCoach() {
         audio: false,
       });
       logStartupEvent('GET_USER_MEDIA_SUCCESS');
-      console.info('[LiftAI] Webcam stream granted.');
 
       streamRef.current = stream;
       const video = videoRef.current;
-      if (!video) {
-        throw new Error('Video element is not ready.');
-      }
+      if (!video) throw new Error('Video element is not ready.');
 
       video.srcObject = stream;
       await video.play();
       logStartupEvent('VIDEO_PLAY_SUCCESS');
-      console.info('[LiftAI] Video element is playing.');
 
       setState((current) => ({
         ...current,
@@ -282,25 +247,16 @@ export function useLiftAiCoach() {
 
       setState((current) => ({
         ...current,
-        diagnostics: {
-          ...current.diagnostics,
-          startupStage: 'mediapipe_loading',
-        },
+        diagnostics: { ...current.diagnostics, startupStage: 'mediapipe_loading' },
       }));
       logStartupEvent('MEDIAPIPE_INIT_START');
-      console.info('[LiftAI] MediaPipe initialization started.');
       const poseLandmarker = await getPoseLandmarker();
       logStartupEvent('MEDIAPIPE_INIT_SUCCESS');
-      console.info('[LiftAI] MediaPipe initialization finished.');
-      const canvas = canvasRef.current;
-      if (!canvas) {
-        throw new Error('Canvas element is not ready.');
-      }
 
+      const canvas = canvasRef.current;
+      if (!canvas) throw new Error('Canvas element is not ready.');
       const ctx = canvas.getContext('2d');
-      if (!ctx) {
-        throw new Error('Could not create canvas context.');
-      }
+      if (!ctx) throw new Error('Could not create canvas context.');
 
       const drawingUtils = createDrawingUtils(ctx);
       const sessionStartedAt = Date.now();
@@ -322,9 +278,7 @@ export function useLiftAiCoach() {
       }));
 
       const renderFrame = () => {
-        if (!videoRef.current || !canvasRef.current) {
-          return;
-        }
+        if (!videoRef.current || !canvasRef.current) return;
 
         try {
           const currentVideo = videoRef.current;
@@ -333,10 +287,6 @@ export function useLiftAiCoach() {
           const videoHeight = currentVideo.videoHeight;
 
           if (!videoWidth || !videoHeight) {
-            console.debug('[LiftAI] Waiting for valid video dimensions.', {
-              videoWidth,
-              videoHeight,
-            });
             setState((current) => ({
               ...current,
               diagnostics: {
@@ -352,17 +302,13 @@ export function useLiftAiCoach() {
           }
 
           frameCountRef.current += 1;
-          currentCanvas.width = currentVideo.videoWidth;
-          currentCanvas.height = currentVideo.videoHeight;
+          currentCanvas.width = videoWidth;
+          currentCanvas.height = videoHeight;
 
           const result = poseLandmarker.detectForVideo(currentVideo, performance.now());
           const landmarks = result.landmarks[0];
-          const frameDiagnostics = deriveFrameDiagnostics(
-            result,
-            currentVideo,
-            currentCanvas,
-            frameCountRef.current,
-          );
+          const requiredIndices = exerciseDefinition.requiredLandmarkIndices;
+          const frameDiagnostics = deriveFrameDiagnostics(result, currentVideo, currentCanvas, frameCountRef.current, requiredIndices);
 
           if (frameCountRef.current === 1 || frameCountRef.current % DIAGNOSTIC_LOG_INTERVAL === 0) {
             console.debug('[LiftAI] PoseLandmarker frame output', {
@@ -371,9 +317,6 @@ export function useLiftAiCoach() {
               landmarksDetected: frameDiagnostics.landmarksDetected,
               trackedJointsVisible: frameDiagnostics.trackedJointsVisible,
               poseStatus: frameDiagnostics.poseStatus,
-              videoDimensions: frameDiagnostics.videoDimensions,
-              canvasDimensions: frameDiagnostics.canvasDimensions,
-              rawResult: result,
             });
           }
 
@@ -402,27 +345,21 @@ export function useLiftAiCoach() {
           }
         } catch (error) {
           const details = normalizeError(error);
-          const message = details.message;
-          console.error('[LiftAI] Pose detection loop failed.', {
-            name: details.name,
-            message: details.message,
-            stack: details.stack,
-            error,
-          });
+          console.error('[LiftAI] Pose detection loop failed.', details);
           stop();
           setState((current) => ({
             ...current,
             diagnostics: {
               ...current.diagnostics,
               mediaPipeStatus: 'failed',
-              mediaPipeDetail: message,
+              mediaPipeDetail: details.message,
               poseModelStatus: 'failed',
-              poseModelDetail: message,
+              poseModelDetail: details.message,
               poseStatus: 'none',
               detectForVideoActive: false,
             },
-            errors: appendError(current.errors, message),
-            error: message,
+            errors: appendError(current.errors, details.message),
+            error: details.message,
           }));
           return;
         }
@@ -431,46 +368,28 @@ export function useLiftAiCoach() {
       };
 
       logStartupEvent('POSE_LOOP_STARTED');
-      console.info('[LiftAI] Pose detection loop started.');
       animationFrameRef.current = window.requestAnimationFrame(renderFrame);
     } catch (error) {
       const details = normalizeError(error);
-      console.error('[LiftAI] Startup failure', {
-        name: details.name,
-        message: details.message,
-        stack: details.stack,
-        error,
-      });
+      console.error('[LiftAI] Startup failure', details);
       stop();
-      const message = details.message;
       setState((current) => ({
         ...current,
         diagnostics: {
           ...current.diagnostics,
           startupStage: 'failed',
-          mediaPipeStatus:
-            current.diagnostics.mediaPipeStatus === 'loading' ? 'failed' : current.diagnostics.mediaPipeStatus,
-          mediaPipeDetail:
-            current.diagnostics.mediaPipeStatus === 'loading'
-              ? message
-              : current.diagnostics.mediaPipeDetail,
-          poseModelStatus:
-            current.diagnostics.poseModelStatus === 'loading' ? 'failed' : current.diagnostics.poseModelStatus,
-          poseModelDetail:
-            current.diagnostics.poseModelStatus === 'loading'
-              ? message
-              : current.diagnostics.poseModelDetail,
+          mediaPipeStatus: current.diagnostics.mediaPipeStatus === 'loading' ? 'failed' : current.diagnostics.mediaPipeStatus,
+          mediaPipeDetail: current.diagnostics.mediaPipeStatus === 'loading' ? details.message : current.diagnostics.mediaPipeDetail,
+          poseModelStatus: current.diagnostics.poseModelStatus === 'loading' ? 'failed' : current.diagnostics.poseModelStatus,
+          poseModelDetail: current.diagnostics.poseModelStatus === 'loading' ? details.message : current.diagnostics.poseModelDetail,
           poseStatus: 'none',
           detectForVideoActive: false,
           webcamActive: false,
-          cameraPermissionStatus:
-            current.diagnostics.cameraPermissionStatus === 'unknown'
-              ? 'denied'
-              : current.diagnostics.cameraPermissionStatus,
+          cameraPermissionStatus: current.diagnostics.cameraPermissionStatus === 'unknown' ? 'denied' : current.diagnostics.cameraPermissionStatus,
         },
-        errors: appendError(current.errors, message),
+        errors: appendError(current.errors, details.message),
         isLoading: false,
-        error: message,
+        error: details.message,
       }));
     }
   }
@@ -518,41 +437,28 @@ export function useLiftAiCoach() {
     landmarks: NormalizedLandmark[],
     frameDiagnostics: ReturnType<typeof deriveFrameDiagnostics>,
   ) {
-    const joints = extractTrackedJoints(landmarks);
-    const angles = calculatePoseAngles(joints);
-    const squat = machineRef.current.update(angles);
-    const feedback = analyzeForm(joints, angles, squat);
-    const coachingCue = getCoachingCue(squat, feedback.warnings, coachingStateRef.current);
-    coachingStateRef.current = {
-      previousCorrection: coachingCue.nextCorrection,
-      previousPhase: coachingCue.nextPhase,
-      previousRepCount: coachingCue.nextRepCount,
-    };
+    if (!exerciseDefinition || !analyzerRef.current) return;
 
-    if (coachingCue.message) {
-      audioRef.current.speak(coachingCue.message);
-    }
+    const angles = computeAngles(landmarks, exerciseDefinition.angleRequests);
+    const result = analyzerRef.current.processFrame(landmarks, angles);
+    const message = analyzerRef.current.getCoachingCue(result);
 
-    if (squat.repCount > lastRepRef.current) {
-      lastRepRef.current = squat.repCount;
+    if (message) {
+      audioRef.current.speak(message);
     }
 
     maybePublishDiagnostics(frameDiagnostics, {
-      joints,
       angles,
-      feedback,
-      squat,
+      result,
       timestamp: Date.now(),
     });
   }
 
   function maybePublishDiagnostics(
     frameDiagnostics: ReturnType<typeof deriveFrameDiagnostics>,
-    snapshot?: PoseSnapshot,
+    snapshot?: ExerciseSnapshot,
   ) {
-    if (!shouldPublishUiUpdate(lastUiUpdateRef.current, frameDiagnostics, snapshot)) {
-      return;
-    }
+    if (!shouldPublishUiUpdate(lastUiUpdateRef.current, snapshot)) return;
 
     lastUiUpdateRef.current = performance.now();
     setState((current) => ({
@@ -577,10 +483,6 @@ export function useLiftAiCoach() {
   };
 }
 
-function isPoseVisible(landmarks: NormalizedLandmark[]) {
-  return classifyPoseStatus(landmarks) !== 'none';
-}
-
 function appendError(errors: string[], message: string) {
   return errors.includes(message) ? errors : [...errors, message];
 }
@@ -589,25 +491,11 @@ function appendStartupEvent(events: string[], event: string) {
   return events.length >= 12 ? [...events.slice(-11), event] : [...events, event];
 }
 
-function shouldPublishUiUpdate(
-  lastPublishedAt: number,
-  frameDiagnostics: ReturnType<typeof deriveFrameDiagnostics>,
-  snapshot?: PoseSnapshot,
-) {
+function shouldPublishUiUpdate(lastPublishedAt: number, snapshot?: ExerciseSnapshot) {
   const now = performance.now();
-  if (now - lastPublishedAt >= UI_UPDATE_INTERVAL_MS) {
-    return true;
-  }
-
-  if (!snapshot) {
-    return false;
-  }
-
-  return (
-    snapshot.squat.repCount > 0 ||
-    snapshot.squat.phase !== 'standing' ||
-    frameDiagnostics.poseStatus !== 'none'
-  );
+  if (now - lastPublishedAt >= UI_UPDATE_INTERVAL_MS) return true;
+  if (!snapshot) return false;
+  return snapshot.result.repCount > 0 || snapshot.result.warnings.length > 0;
 }
 
 function deriveFrameDiagnostics(
@@ -615,12 +503,13 @@ function deriveFrameDiagnostics(
   video: HTMLVideoElement,
   canvas: HTMLCanvasElement,
   frameCount: number,
+  requiredIndices: number[],
 ) {
   const primaryLandmarks = result.landmarks[0] ?? [];
-  const trackedJointsVisible = countTrackedVisibleJoints(primaryLandmarks);
+  const trackedJointsVisible = countTrackedVisibleJoints(primaryLandmarks, requiredIndices);
 
   return {
-    poseStatus: classifyPoseStatus(primaryLandmarks),
+    poseStatus: classifyPoseStatus(trackedJointsVisible),
     posesDetected: result.landmarks.length,
     landmarksDetected: primaryLandmarks.length,
     trackedJointsVisible,
@@ -631,22 +520,14 @@ function deriveFrameDiagnostics(
   };
 }
 
-function classifyPoseStatus(landmarks: NormalizedLandmark[]) {
-  const trackedVisible = countTrackedVisibleJoints(landmarks);
-  if (trackedVisible >= FULL_POSE_VISIBLE_JOINTS) {
-    return 'full' as const;
-  }
-
-  if (trackedVisible >= PARTIAL_POSE_VISIBLE_JOINTS) {
-    return 'partial' as const;
-  }
-
+function classifyPoseStatus(trackedVisible: number) {
+  if (trackedVisible >= FULL_POSE_VISIBLE_JOINTS) return 'full' as const;
+  if (trackedVisible >= PARTIAL_POSE_VISIBLE_JOINTS) return 'partial' as const;
   return 'none' as const;
 }
 
-function countTrackedVisibleJoints(landmarks: NormalizedLandmark[]) {
-  const requiredIndexes = [11, 12, 23, 24, 25, 26, 27, 28];
-  return requiredIndexes.reduce((count, index) => {
+function countTrackedVisibleJoints(landmarks: NormalizedLandmark[], requiredIndices: number[]) {
+  return requiredIndices.reduce((count, index) => {
     const visibility = landmarks[index]?.visibility ?? 0;
     return visibility > MIN_VISIBILITY ? count + 1 : count;
   }, 0);

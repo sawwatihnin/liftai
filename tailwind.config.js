@@ -7,9 +7,13 @@ export default {
         obsidian: '#09090B',
         night: '#111017',
         panel: '#17131B',
+        ink: '#0C0A14',
         burgundy: '#7B1123',
         garnet: '#A11A33',
         rose: '#D94B6A',
+        aqua: '#38D9A9',
+        gold: '#F6AD55',
+        coral: '#FC8181',
         text: '#F7F7F8',
         muted: '#9EA0A8',
         success: '#22C55E',
@@ -23,6 +27,8 @@ export default {
           '0 0 0 1px rgba(161, 26, 51, 0.28), 0 20px 60px rgba(123, 17, 35, 0.24), inset 0 1px 0 rgba(255,255,255,0.04)',
         tracking:
           '0 0 0 1px rgba(217,75,106,0.32), 0 0 0 8px rgba(123,17,35,0.08), 0 24px 70px rgba(123,17,35,0.26)',
+        glow:
+          '0 0 0 1px rgba(56,217,169,0.15), 0 8px 32px rgba(56,217,169,0.08)',
       },
       fontFamily: {
         sans: ['"Sora"', 'ui-sans-serif', 'system-ui'],

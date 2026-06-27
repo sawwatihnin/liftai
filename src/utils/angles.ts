@@ -1,5 +1,19 @@
+import type { NormalizedLandmark } from '@mediapipe/tasks-vision';
 import type { PoseAngles, PoseJoints } from '../pose/types';
 import { angleBetweenPoints, angleFromVertical, averagePoint } from './geometry';
+
+// Generic angle computation: runs every AngleRequest against raw landmarks
+// and returns a named map. Each exercise provides its own request list.
+export function computeAngles(
+  landmarks: NormalizedLandmark[],
+  requests: ReadonlyArray<{ key: string; compute: (l: NormalizedLandmark[]) => number }>,
+): Record<string, number> {
+  const result: Record<string, number> = {};
+  for (const req of requests) {
+    result[req.key] = req.compute(landmarks);
+  }
+  return result;
+}
 
 export function calculatePoseAngles(joints: PoseJoints): PoseAngles {
   const hipCenter = averagePoint(joints.leftHip, joints.rightHip);
